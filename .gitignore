@@ -1,0 +1,9 @@
+# Dati locali
+/data/
+*.db
+*.csv
+
+# Configurazioni locali
+.env
+__pycache__/
+*.pyc
