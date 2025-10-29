@@ -8,7 +8,7 @@ API_KEY = os.getenv("API_FOOTBALL_KEY")
 BASE_URL = "https://v3.football.api-sports.io"
 HEADERS = {"x-apisports-key": API_KEY}
 LEAGUE_ID = 135  # Serie A
-SEASON = 2015
+SEASON = 2020
 
 def call_api(endpoint, params=None):
     url = f"{BASE_URL}{endpoint}"

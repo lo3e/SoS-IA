@@ -1,9 +1,9 @@
-# src/fetch_full_data.py
 import os
 import time
-import argparse
-import requests
+import json
 import sqlite3
+import requests
+import argparse
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -11,7 +11,6 @@ from dotenv import load_dotenv
 load_dotenv()
 API_KEY = os.getenv("API_FOOTBALL_KEY")
 DB_PATH = os.getenv("DB_PATH")
-
 if not API_KEY:
     raise ValueError("❌ API_FOOTBALL_KEY mancante nel file .env")
 if not DB_PATH:
@@ -20,17 +19,19 @@ if not DB_PATH:
 BASE_URL = "https://v3.football.api-sports.io"
 HEADERS = {"x-apisports-key": API_KEY}
 LEAGUE_ID = 135  # Serie A
-SLEEP = 1.2      # rate limit safe delay
+SLEEP_TIME = 1.2
 
-# === UTILS ===
-def call_api(endpoint: str, params: dict = None):
-    """Chiama un endpoint API-Football e restituisce la lista 'response'."""
+# === UTILITY ===
+def call_api(endpoint, params=None):
+    """Chiama endpoint API-Football e gestisce rate limit ed errori."""
     url = f"{BASE_URL}{endpoint}"
     try:
         r = requests.get(url, headers=HEADERS, params=params or {}, timeout=30)
+        if r.status_code == 429:
+            print("🚫 Limite API raggiunto. Stop sicuro per non bruciare call.")
+            return None
         r.raise_for_status()
-        data = r.json()
-        return data.get("response", [])
+        return r.json().get("response", [])
     except Exception as e:
         print(f"⚠️ Errore chiamando {endpoint}: {e}")
         return []
@@ -38,137 +39,306 @@ def call_api(endpoint: str, params: dict = None):
 def connect_db():
     return sqlite3.connect(DB_PATH)
 
-# === INSERT FUNCS ===
-def insert_match(conn, m):
-    c = conn.cursor()
-    f, l, t, g = m["fixture"], m["league"], m["teams"], m["goals"]
-    c.execute("""
-        INSERT OR REPLACE INTO matches
-        (match_id, date, season, league_id, league_name, home_team_id, away_team_id,
-         home_team_name, away_team_name, home_goals, away_goals, status, venue_id, last_update)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        f.get("id"), f.get("date"), l.get("season"), l.get("id"), l.get("name"),
-        t.get("home", {}).get("id"), t.get("away", {}).get("id"),
-        t.get("home", {}).get("name"), t.get("away", {}).get("name"),
-        g.get("home"), g.get("away"), f.get("status", {}).get("short"),
-        f.get("venue", {}).get("id"), f.get("updated_at")
-    ))
+# === FUNZIONI DI CHECK ===
+def exists(c, table, field, value):
+    c.execute(f"SELECT 1 FROM {table} WHERE {field} = ? LIMIT 1", (value,))
+    return c.fetchone() is not None
 
+def exists_injuries_for_season(c, season):
+    c.execute("SELECT 1 FROM injuries i JOIN matches m ON i.match_id = m.match_id WHERE m.season = ? LIMIT 1", (season,))
+    return c.fetchone() is not None
+
+# === INSERIMENTO DATI ===
 def insert_team(conn, t):
     c = conn.cursor()
-    team, venue = t["team"], t.get("venue", {})
+    team = t.get("team", {})
     c.execute("""
         INSERT OR REPLACE INTO teams (team_id, name, country, founded, last_update)
         VALUES (?, ?, ?, ?, ?)
-    """, (team.get("id"), team.get("name"), team.get("country"),
-          team.get("founded"), team.get("updated_at")))
+    """, (
+        team.get("id"),
+        team.get("name"),
+        team.get("country"),
+        team.get("founded"),
+        team.get("update")
+    ))
+
+def insert_match(conn, m):
+    c = conn.cursor()
+    fixture = m.get("fixture", {})
+    league = m.get("league", {})
+    teams = m.get("teams", {})
+    goals = m.get("goals", {})
+
+    c.execute("""
+        INSERT OR REPLACE INTO matches (
+            match_id, date, season, league_id, league_name,
+            home_team_id, away_team_id, home_team_name, away_team_name,
+            home_goals, away_goals, status, venue_id, last_update
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        fixture.get("id"),
+        fixture.get("date"),
+        league.get("season"),
+        league.get("id"),
+        league.get("name"),
+        teams.get("home", {}).get("id"),
+        teams.get("away", {}).get("id"),
+        teams.get("home", {}).get("name"),
+        teams.get("away", {}).get("name"),
+        goals.get("home"),
+        goals.get("away"),
+        fixture.get("status", {}).get("short"),
+        fixture.get("venue", {}).get("id"),
+        fixture.get("updated_at")
+    ))
 
 def insert_team_stats(conn, fixture_id):
-    data = call_api("/fixtures/statistics", {"fixture": fixture_id})
-    if not data:
-        return
+    stats = call_api("/fixtures/statistics", {"fixture": fixture_id})
+    if stats is None:
+        return False
+    if not stats:
+        return True
+
     c = conn.cursor()
-    for t in data:
-        team = t["team"]
-        for s in t["statistics"]:
+    for team_block in stats:
+        team_id = team_block["team"]["id"]
+        team_name = team_block["team"]["name"]
+        for s in team_block["statistics"]:
             c.execute("""
                 INSERT INTO team_stats (match_id, team_id, team_name, stat_type, stat_value)
                 VALUES (?, ?, ?, ?, ?)
-            """, (fixture_id, team["id"], team["name"], s["type"], str(s["value"]) if s["value"] else None))
+            """, (fixture_id, team_id, team_name, s.get("type"), str(s.get("value"))))
     conn.commit()
+    return True
 
 def insert_players(conn, fixture_id):
+    """
+    Scarica le statistiche giocatore-per-match da /fixtures/players
+    e le inserisce nella tabella players con lo schema attuale.
+    """
     data = call_api("/fixtures/players", {"fixture": fixture_id})
+    if data is None:
+        # limite API raggiunto -> fermiamoci senza crash
+        return False
     if not data:
-        return
+        # nessun dato per questo match -> non è un errore
+        return True
+
     c = conn.cursor()
-    for team_data in data:
-        team_id = team_data["team"]["id"]
-        for p in team_data["players"]:
-            player = p["player"]
-            stats = p["statistics"][0] if p["statistics"] else {}
+
+    for team_block in data:
+        team_info = team_block.get("team", {})
+        team_id = team_info.get("id")
+
+        for player_block in team_block.get("players", []):
+            player_info = player_block.get("player", {})
+            stats_list = player_block.get("statistics", [])
+            stats = stats_list[0] if stats_list else {}
+
+            games_stats = stats.get("games", {}) or {}
+            shots_stats = stats.get("shots", {}) or {}
+            goals_stats = stats.get("goals", {}) or {}
+            passes_stats = stats.get("passes", {}) or {}
+            tackles_stats = stats.get("tackles", {}) or {}
+            duels_stats = stats.get("duels", {}) or {}
+            cards_stats = stats.get("cards", {}) or {}
+
             c.execute("""
-                INSERT INTO players (match_id, team_id, player_id, player_name, position, minutes,
-                    rating, shots_total, shots_on, goals_total, assists, passes_total, passes_key,
-                    tackles, interceptions, duels_total, duels_won, yellow_cards, red_cards)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO players (
+                    match_id,
+                    team_id,
+                    player_id,
+                    player_name,
+                    position,
+                    minutes,
+                    rating,
+                    shots_total,
+                    shots_on,
+                    goals_total,
+                    assists,
+                    passes_total,
+                    passes_key,
+                    tackles,
+                    interceptions,
+                    duels_total,
+                    duels_won,
+                    yellow_cards,
+                    red_cards
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                fixture_id, team_id, player["id"], player["name"], player.get("position"),
-                stats.get("games", {}).get("minutes"),
-                stats.get("games", {}).get("rating"),
-                stats.get("shots", {}).get("total"),
-                stats.get("shots", {}).get("on"),
-                stats.get("goals", {}).get("total"),
-                stats.get("goals", {}).get("assists"),
-                stats.get("passes", {}).get("total"),
-                stats.get("passes", {}).get("key"),
-                stats.get("tackles", {}).get("total"),
-                stats.get("tackles", {}).get("interceptions"),
-                stats.get("duels", {}).get("total"),
-                stats.get("duels", {}).get("won"),
-                stats.get("cards", {}).get("yellow"),
-                stats.get("cards", {}).get("red")
+                fixture_id,
+                team_id,
+                player_info.get("id"),
+                player_info.get("name"),
+                player_info.get("position"),
+                games_stats.get("minutes"),
+                games_stats.get("rating"),
+                shots_stats.get("total"),
+                shots_stats.get("on"),
+                goals_stats.get("total"),
+                goals_stats.get("assists"),
+                passes_stats.get("total"),
+                passes_stats.get("key"),
+                tackles_stats.get("total"),
+                tackles_stats.get("interceptions"),
+                duels_stats.get("total"),
+                duels_stats.get("won"),
+                cards_stats.get("yellow"),
+                cards_stats.get("red")
             ))
+
     conn.commit()
+    return True
 
 def insert_lineups(conn, fixture_id):
     data = call_api("/fixtures/lineups", {"fixture": fixture_id})
+    if data is None:
+        return False
     if not data:
-        return
+        return True
+
     c = conn.cursor()
-    for team_data in data:
-        team = team_data["team"]
-        coach = team_data.get("coach", {}).get("name")
-        formation = team_data.get("formation")
-        # Start XI
-        for p in team_data.get("startXI", []):
+
+    for team_block in data:
+        team = team_block.get("team", {})
+        team_id = team.get("id")
+        team_name = team.get("name")
+
+        formation = team_block.get("formation")
+        coach_name = team_block.get("coach", {}).get("name")
+
+        # titolari
+        for p in team_block.get("startXI", []):
+            player_id = p.get("player", {}).get("id")
+            player_name = p.get("player", {}).get("name")
+            position = p.get("player", {}).get("pos")
             c.execute("""
-                INSERT INTO lineups (match_id, team_id, team_name, formation, coach_name, player_id, player_name, position, is_starter)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
-            """, (fixture_id, team["id"], team["name"], formation, coach,
-                  p["player"]["id"], p["player"]["name"], p["player"]["pos"]))
-        # Substitutes
-        for p in team_data.get("substitutes", []):
+                INSERT INTO lineups (
+                    match_id, team_id, team_name,
+                    formation, coach_name,
+                    player_id, player_name, position, is_starter
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+            """, (
+                fixture_id,
+                team_id,
+                team_name,
+                formation,
+                coach_name,
+                player_id,
+                player_name,
+                position
+            ))
+
+        # panchina
+        for p in team_block.get("substitutes", []):
+            player_id = p.get("player", {}).get("id")
+            player_name = p.get("player", {}).get("name")
+            position = p.get("player", {}).get("pos")
             c.execute("""
-                INSERT INTO lineups (match_id, team_id, team_name, formation, coach_name, player_id, player_name, position, is_starter)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
-            """, (fixture_id, team["id"], team["name"], formation, coach,
-                  p["player"]["id"], p["player"]["name"], p["player"]["pos"]))
+                INSERT INTO lineups (
+                    match_id, team_id, team_name,
+                    formation, coach_name,
+                    player_id, player_name, position, is_starter
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+            """, (
+                fixture_id,
+                team_id,
+                team_name,
+                formation,
+                coach_name,
+                player_id,
+                player_name,
+                position
+            ))
+
     conn.commit()
+    return True
 
 def insert_events(conn, fixture_id):
     data = call_api("/fixtures/events", {"fixture": fixture_id})
+    if data is None:
+        return False
     if not data:
-        return
+        return True
+
     c = conn.cursor()
     for e in data:
         c.execute("""
-            INSERT INTO events (match_id, time_elapsed, team_id, team_name, player_id, player_name, assist_name, type, detail, comments)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO events (
+                match_id,
+                time_elapsed,
+                team_id,
+                team_name,
+                player_id,
+                player_name,
+                assist_name,
+                type,
+                detail,
+                comments
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             fixture_id,
-            e["time"].get("elapsed"),
-            e["team"].get("id"),
-            e["team"].get("name"),
-            e["player"].get("id"),
-            e["player"].get("name"),
-            e.get("assist", {}).get("name"),
-            e.get("type"), e.get("detail"), e.get("comments")
+            e.get("time", {}).get("elapsed"),
+            e.get("team", {}).get("id"),
+            e.get("team", {}).get("name"),
+            e.get("player", {}).get("id") if e.get("player") else None,
+            e.get("player", {}).get("name") if e.get("player") else None,
+            e.get("assist", {}).get("name") if e.get("assist") else None,
+            e.get("type"),
+            e.get("detail"),
+            e.get("comments")
         ))
+
+    conn.commit()
+    return True
+
+def insert_odds(conn, season):
+    data = call_api("/odds", {"league": LEAGUE_ID, "season": season})
+    if data is None or not data:
+        print("⚠️ Nessuna quota disponibile per questa stagione.")
+        return
+    c = conn.cursor()
+    for m in data:
+        match_id = m["fixture"]["id"]
+        for bookmaker in m.get("bookmakers", []):
+            for bet in bookmaker.get("bets", []):
+                market = bet.get("name")
+                for val in bet.get("values", []):
+                    c.execute("""
+                        INSERT INTO odds (match_id, bookmaker_id, bookmaker_name, market, outcome, odd)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (
+                        match_id,
+                        bookmaker.get("id"),
+                        bookmaker.get("name"),
+                        market,
+                        val.get("value"),
+                        val.get("odd")
+                    ))
     conn.commit()
 
-def insert_predictions(conn, fixture_id):
-    data = call_api("/predictions", {"fixture": fixture_id})
+def insert_prediction(conn, match_id):
+    data = call_api("/predictions", {"fixture": match_id})
+    if data is None:
+        return False
     if not data:
-        return
-    p = data[0]["predictions"]
+        return True
+
+    p = data[0].get("predictions", {})
     c = conn.cursor()
     c.execute("""
-        INSERT INTO predictions (match_id, winner, win_or_draw, advice, prob_home, prob_draw, prob_away)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO predictions (
+            match_id,
+            winner,
+            win_or_draw,
+            advice,
+            prob_home,
+            prob_draw,
+            prob_away
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
     """, (
-        fixture_id,
+        match_id,
         p.get("winner", {}).get("name"),
         1 if p.get("win_or_draw") else 0,
         p.get("advice"),
@@ -177,29 +347,63 @@ def insert_predictions(conn, fixture_id):
         p.get("percent", {}).get("away")
     ))
     conn.commit()
+    return True
 
 def insert_head2head(conn, home_id, away_id, season):
-    data = call_api("/fixtures/headtohead", {"h2h": f"{home_id}-{away_id}", "league": LEAGUE_ID, "season": season})
+    data = call_api("/fixtures/headtohead", {
+        "h2h": f"{home_id}-{away_id}",
+        "league": LEAGUE_ID,
+        "season": season
+    })
+    if data is None:
+        return False
     if not data:
-        return
+        return True
+
     c = conn.cursor()
     for match in data:
-        f, g = match["fixture"], match["goals"]
+        fixture = match.get("fixture", {})
+        goals = match.get("goals", {})
         c.execute("""
-            INSERT INTO head2head (home_team_id, away_team_id, match_id, home_goals, away_goals, season)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (home_id, away_id, f["id"], g["home"], g["away"], season))
+            INSERT INTO head2head (
+                home_team_id,
+                away_team_id,
+                match_id,
+                home_goals,
+                away_goals,
+                season
+            ) VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            home_id,
+            away_id,
+            fixture.get("id"),
+            goals.get("home"),
+            goals.get("away"),
+            season
+        ))
     conn.commit()
+    return True
 
 def insert_injuries(conn, season):
     data = call_api("/injuries", {"league": LEAGUE_ID, "season": season})
+    if data is None:
+        return False
     if not data:
-        return
+        print("   ⚠️ Nessun infortunio disponibile per questa stagione.")
+        return True
+
     c = conn.cursor()
     for inj in data:
         c.execute("""
-            INSERT INTO injuries (match_id, player_id, player_name, team_id, reason, since, expected_return)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO injuries (
+                match_id,
+                player_id,
+                player_name,
+                team_id,
+                reason,
+                since,
+                expected_return
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (
             inj.get("fixture", {}).get("id"),
             inj.get("player", {}).get("id"),
@@ -210,88 +414,51 @@ def insert_injuries(conn, season):
             inj.get("player", {}).get("expected_return")
         ))
     conn.commit()
-
-def insert_odds(conn, season):
-    data = call_api("/odds", {"league": LEAGUE_ID, "season": season})
-    if not data:
-        return
-    c = conn.cursor()
-    for o in data:
-        match_id = o["fixture"]["id"]
-        for b in o["bookmakers"]:
-            for bet in b.get("bets", []):
-                for val in bet.get("values", []):
-                    c.execute("""
-                        INSERT INTO odds (match_id, bookmaker_id, bookmaker_name, market, outcome, odd, timestamp, source)
-                        VALUES (?, ?, ?, ?, ?, ?, datetime('now'), 'api')
-                    """, (
-                        match_id, b["id"], b["name"], bet["name"],
-                        val["value"], val["odd"]
-                    ))
-    conn.commit()
+    return True
 
 # === MAIN ===
 def fetch_season(season):
     conn = connect_db()
     c = conn.cursor()
-    print(f"\n📅 Scarico stagione {season} per Serie A...")
+    print(f"\n📅 Scarico stagione {season} Serie A...")
 
+    # 1️⃣ TEAMS
     teams = call_api("/teams", {"league": LEAGUE_ID, "season": season})
-    for t in teams: insert_team(conn, t)
+    for t in teams:
+        insert_team(conn, t)
     print(f"✅ {len(teams)} squadre salvate")
 
+    # 2️⃣ FIXTURES
     fixtures = call_api("/fixtures", {"league": LEAGUE_ID, "season": season})
-    print(f"✅ {len(fixtures)} partite trovate\n")
+    print(f"✅ {len(fixtures)} partite trovate")
 
-    new_count = 0
-    skipped_count = 0
+    for idx, m in enumerate(fixtures, start=1):
+        f_id = m["fixture"]["id"]
+        print(f"\n({idx}/{len(fixtures)}) ▶️ Fixture {f_id}")
 
-    for i, m in enumerate(fixtures):
-        fixture_id = m["fixture"]["id"]
-        print(f"({i+1}/{len(fixtures)}) Controllo fixture {fixture_id}...")
-
-        # --- 🔍 verifica se abbiamo già tutto ---
-        c.execute("""
-            SELECT 
-                (SELECT COUNT(*) FROM matches WHERE match_id = ?) AS match_ok,
-                (SELECT COUNT(*) FROM team_stats WHERE match_id = ?) AS stats_ok,
-                (SELECT COUNT(*) FROM lineups WHERE match_id = ?) AS lineups_ok,
-                (SELECT COUNT(*) FROM players WHERE match_id = ?) AS players_ok,
-                (SELECT COUNT(*) FROM events WHERE match_id = ?) AS events_ok
-        """, (fixture_id, fixture_id, fixture_id, fixture_id, fixture_id))
-        
-        match_ok, stats_ok, lineups_ok, players_ok, events_ok = c.fetchone()
-
-        # ✅ se tutti i dati sono già presenti → skip
-        if all(x > 0 for x in [match_ok, stats_ok, lineups_ok, players_ok, events_ok]):
-            print(f"   ✅ Fixture {fixture_id} già completa, skip.")
-            skipped_count += 1
-            continue
-
-        # 💾 altrimenti scarica e salva tutto
-        print(f"   📥 Scarico dati completi per fixture {fixture_id}...")
-        try:
+        if not exists(c, "matches", "match_id", f_id):
             insert_match(conn, m)
-            insert_team_stats(conn, fixture_id)
-            insert_lineups(conn, fixture_id)
-            insert_players(conn, fixture_id)
-            insert_events(conn, fixture_id)
-            conn.commit()
-            time.sleep(SLEEP)
-            new_count += 1
-        except Exception as e:
-            print(f"⚠️ Errore su fixture {fixture_id}: {e}")
-            conn.commit()
 
-    # --- 📊 Riepilogo finale ---
-    print("\n📊 Riepilogo stagione:")
-    print(f"   🟢 Nuove fixture scaricate: {new_count}")
-    print(f"   🟡 Fixture già complete: {skipped_count}")
-    print(f"   🔢 Totale fixture processate: {len(fixtures)}\n")
+        insert_team_stats(conn, f_id)
+        insert_players(conn, f_id)
+        insert_lineups(conn, f_id)
+        insert_events(conn, f_id)
+        insert_prediction(conn, f_id)
+        insert_head2head(conn, m["teams"]["home"]["id"], m["teams"]["away"]["id"], season)
 
-# === ENTRY POINT ===
+        time.sleep(SLEEP_TIME)
+
+    insert_odds(conn, season)
+
+    if not exists_injuries_for_season(c, season):
+        insert_injuries(conn, season)
+
+    print(f"\n✅ Stagione {season} completata e salvata nel DB.")
+    conn.close()
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Scarica una stagione completa da API-Football")
-    parser.add_argument("--season", type=int, required=True, help="Anno stagione es. 2015")
+    parser = argparse.ArgumentParser(description="Scarica tutti i dati per una stagione Serie A")
+    parser.add_argument("--season", type=int, required=True, help="Anno della stagione (es. 2021)")
     args = parser.parse_args()
+
     fetch_season(args.season)
