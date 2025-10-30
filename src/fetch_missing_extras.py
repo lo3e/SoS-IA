@@ -152,22 +152,48 @@ def complete_missing_for_season(season: int):
                 print("   ⚠️ Nessun head2head")
             time.sleep(SLEEP_TIME)
 
-        # === INJURIES (una sola chiamata per stagione) ===
-        if have_injuries(c, fixtures[0][0]):  # controlla se c'è almeno un injury già salvato
-            print("💊 Injuries già presenti per la stagione → skip totale")
+        # === INJURIES (una sola volta per stagione, come nello script principale) ===
+        print(f"\n💊 Controllo infortuni per la stagione {season} ...")
+        c.execute("""
+            SELECT COUNT(*) FROM injuries
+            WHERE match_id IN (
+                SELECT match_id FROM matches WHERE season = ?
+            )
+        """, (season,))
+        count_inj = c.fetchone()[0]
+
+        if count_inj > 0:
+            print(f"   🔁 Injuries già presenti → {count_inj} record trovati → skip")
         else:
-            print(f"💊 Scarico tutti gli injuries per la stagione {season} ...")
+            print("   📡 Scarico injuries stagione intera ...")
             data_inj = call_api("/injuries", {"league": LEAGUE_ID, "season": season})
             if data_inj is None:
-                print("   🚫 Limite API raggiunto — stop sicuro.")
-                conn.close()
-                return
-            if data_inj:
-                save_injuries(conn, None, data_inj)
-                print(f"   ✅ Salvati {len(data_inj)} infortuni")
-            else:
+                print("   🚫 Limite API raggiunto — fermo qui per non bruciare altre call.")
+            elif not data_inj:
                 print("   ⚠️ Nessun infortunio restituito dall'API per questa stagione")
-            time.sleep(SLEEP_TIME)
+            else:
+                for inj in data_inj:
+                    c.execute("""
+                        INSERT OR IGNORE INTO injuries (
+                            match_id,
+                            player_id,
+                            player_name,
+                            team_id,
+                            reason,
+                            since,
+                            expected_return
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        inj.get("fixture", {}).get("id"),
+                        inj.get("player", {}).get("id"),
+                        inj.get("player", {}).get("name"),
+                        inj.get("team", {}).get("id"),
+                        inj.get("player", {}).get("reason"),
+                        inj.get("player", {}).get("since"),
+                        inj.get("player", {}).get("expected_return")
+                    ))
+                conn.commit()
+                print(f"   ✅ Salvati {len(data_inj)} infortuni per la stagione {season}")
 
     conn.close()
     print(f"\n✅ Stagione {season} completata (solo dati mancanti aggiornati).")
