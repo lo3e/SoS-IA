@@ -8,6 +8,7 @@ import requests
 from pathlib import Path
 from dotenv import load_dotenv
 from classify_injuries import classify_injuries
+from optimize_db import optimize_database
 
 load_dotenv()
 
@@ -46,37 +47,40 @@ def call_api(endpoint: str, params: dict = None):
 def connect_db():
     return sqlite3.connect(DB_PATH)
 
-
 # ---------------------------------------------------------
 # 1) aggiorna fixtures future (NS) entro N giorni
 # ---------------------------------------------------------
 def update_fixtures(conn):
     c = conn.cursor()
 
-    # prendo le partite ancora da giocare
+    # 1️⃣ Seleziono tutte le partite non finite o recenti (ultimi 3 giorni)
     c.execute("""
         SELECT match_id, date
         FROM matches
         WHERE status != 'FT'
+           OR date(date) >= date('now', '-3 days')
     """)
     rows = c.fetchall()
     if not rows:
-        print("📭 Nessuna fixture futura da aggiornare.")
+        print("📭 Nessuna fixture da aggiornare.")
         return
 
     now = datetime.now(timezone.utc)
     to_update = []
+
     for match_id, date_str in rows:
         if not date_str:
             continue
         try:
             dt = datetime.fromisoformat(date_str.replace("Z", "")).replace(tzinfo=timezone.utc)
-            if 0 <= (dt - now).days <= DAYS_AHEAD:
+            # includiamo partite negli ultimi 3 giorni e nei prossimi DAYS_AHEAD
+            delta_days = (dt - now).days
+            if -3 <= delta_days <= DAYS_AHEAD:
                 to_update.append(match_id)
         except Exception:
             continue
 
-    print(f"📅 Fixtures da aggiornare entro {DAYS_AHEAD} giorni: {len(to_update)}")
+    print(f"📅 Fixtures da aggiornare (-3 → +{DAYS_AHEAD} giorni): {len(to_update)}")
 
     for idx, fixture_id in enumerate(to_update, start=1):
         print(f"  ({idx}/{len(to_update)}) 🔁 fixture {fixture_id}")
@@ -84,10 +88,7 @@ def update_fixtures(conn):
         if not data:
             continue
         f = data[0]
-        # aggiorniamo solo status + goals se disponibili
         fixture = f.get("fixture", {})
-        league = f.get("league", {})
-        teams = f.get("teams", {})
         goals = f.get("goals", {})
 
         c.execute("""
@@ -103,7 +104,7 @@ def update_fixtures(conn):
             fixture_id
         ))
 
-        # se la partita è finita ora → scarichiamo stats, events, players, lineups
+        # se la partita è finita → aggiorna anche stats, eventi, lineups, players
         if fixture.get("status", {}).get("short") == "FT":
             insert_team_stats(conn, fixture_id)
             insert_events(conn, fixture_id)
@@ -113,7 +114,8 @@ def update_fixtures(conn):
         time.sleep(SLEEP_TIME)
 
     conn.commit()
-    print("✅ Fixtures aggiornate.")
+    print("✅ Fixtures aggiornate correttamente.")
+
 
 
 # ---------------------------------------------------------
@@ -364,20 +366,19 @@ def insert_players(conn, fixture_id):
             c.execute("""
                 INSERT INTO players (
                     match_id, team_id, player_id, player_name,
-                    position, minutes, rating,
+                    minutes, rating,
                     shots_total, shots_on,
                     goals_total, assists,
                     passes_total, passes_key,
                     tackles, interceptions,
                     duels_total, duels_won,
                     yellow_cards, red_cards
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 fixture_id,
                 team.get("id"),
                 player.get("id"),
                 player.get("name"),
-                stats.get("games", {}).get("position"),
                 stats.get("games", {}).get("minutes"),
                 stats.get("games", {}).get("rating"),
                 stats.get("shots", {}).get("total"),
@@ -478,6 +479,9 @@ def main():
     conn.close()
     print("✅ Aggiornamento completato.")
 
+    # Ottimizza DB dopo aggiornamenti
+    print("\n🧠 Ottimizzo e ricreo viste post-aggiornamento...")
+    optimize_database()
 
 if __name__ == "__main__":
     main()

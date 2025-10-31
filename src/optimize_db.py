@@ -1,65 +1,20 @@
+# === optimize_db.py ===
 import os
 import sqlite3
-import shutil
 from pathlib import Path
 from dotenv import load_dotenv
 
-# === CONFIG ===
 load_dotenv()
+
 DB_PATH = os.getenv("DB_PATH")
 if not DB_PATH:
     DB_PATH = Path(__file__).resolve().parent.parent / "data" / "sosia.db"
 
-BACKUP_PATH = Path(DB_PATH).with_name("sosia_backup_before_optimize.db")
-
-# === UTILS ===
 def connect_db():
     return sqlite3.connect(DB_PATH)
 
-def backup_db():
-    print(f"💾 Creo backup di sicurezza: {BACKUP_PATH}")
-    shutil.copy(DB_PATH, BACKUP_PATH)
-    print("✅ Backup completato.\n")
-
-def drop_columns(conn, table, drop_cols):
-    """Ricostruisce la tabella senza le colonne da rimuovere"""
-    cur = conn.cursor()
-
-    # 1. Ottieni schema originale
-    cur.execute(f"PRAGMA table_info({table});")
-    cols = [c[1] for c in cur.fetchall()]
-    keep_cols = [c for c in cols if c not in drop_cols]
-
-    if not drop_cols:
-        print(f"ℹ️ Nessuna colonna da eliminare in {table}")
-        return
-
-    print(f"🧹 Pulizia tabella {table}: rimuovo {drop_cols}")
-
-    # 2. Crea nuova tabella temporanea
-    cur.execute(f"SELECT sql FROM sqlite_master WHERE type='table' AND name='{table}';")
-    create_sql = cur.fetchone()[0]
-
-    # Rimuovi le colonne non desiderate dallo schema
-    for col in drop_cols:
-        start = create_sql.find(col)
-        if start != -1:
-            # taglio grossolano, più robusto gestendo via nuovo schema
-            pass
-
-    # 3. Leggi schema con colonne da mantenere
-    col_list = ", ".join(keep_cols)
-    temp_table = f"{table}_new"
-
-    cur.execute(f"CREATE TABLE {temp_table} AS SELECT {col_list} FROM {table};")
-    cur.execute(f"DROP TABLE {table};")
-    cur.execute(f"ALTER TABLE {temp_table} RENAME TO {table};")
-    conn.commit()
-
-    print(f"✅ Tabella {table} ricreata senza colonne: {drop_cols}\n")
-
 def create_indexes(conn):
-    print("⚙️ Creazione indici...")
+    print("⚙️ Aggiorno indici principali...")
     cur = conn.cursor()
     indexes = [
         ("idx_matches_match_id", "matches", "match_id"),
@@ -69,54 +24,43 @@ def create_indexes(conn):
         ("idx_predictions_match_id", "predictions", "match_id"),
         ("idx_injuries_match_id", "injuries", "match_id"),
         ("idx_odds_match_id", "odds", "match_id"),
-        ("idx_standings_season_team", "standings", "season, team_id")
+        ("idx_standings_season_team", "standings", "season, team_id"),
     ]
     for name, table, cols in indexes:
         cur.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({cols});")
     conn.commit()
-    print("✅ Indici creati.\n")
+    print("✅ Indici aggiornati.")
 
 def create_views(conn):
-    print("🧩 Creazione viste logiche...")
+    print("🧩 Ricreo viste logiche...")
     cur = conn.cursor()
-
     cur.executescript("""
-    -- 1️⃣ Vista per modello AI
-    CREATE VIEW IF NOT EXISTS match_features_view AS
+    DROP VIEW IF EXISTS match_features_view;
+    DROP VIEW IF EXISTS next_fixtures_view;
+    DROP VIEW IF EXISTS injury_summary_view;
+    DROP VIEW IF EXISTS standings_view;
+    DROP VIEW IF EXISTS player_positions_view;
+    DROP VIEW IF EXISTS player_stats_clean_view;
+    DROP VIEW IF EXISTS player_form_ranking;
+
+    CREATE VIEW match_features_view AS
     SELECT
-        m.match_id,
-        m.season,
-        m.home_team_id,
-        m.away_team_id,
-        m.home_goals,
-        m.away_goals,
-        p.winner,
-        p.prob_home,
-        p.prob_draw,
-        p.prob_away,
-        sh.rank AS home_rank,
-        sa.rank AS away_rank,
-        sh.points AS home_points,
-        sa.points AS away_points
+        m.match_id, m.season, m.round,
+        m.home_team_id, m.away_team_id,
+        m.home_goals, m.away_goals,
+        p.winner, p.prob_home, p.prob_draw, p.prob_away,
+        sh.rank AS home_rank, sa.rank AS away_rank,
+        sh.points AS home_points, sa.points AS away_points
     FROM matches m
     LEFT JOIN predictions p ON m.match_id = p.match_id
     LEFT JOIN standings sh ON sh.team_id = m.home_team_id AND sh.season = m.season
     LEFT JOIN standings sa ON sa.team_id = m.away_team_id AND sa.season = m.season;
 
-    -- 2️⃣ Vista partite future
-    -- 🔄 Ricrea la vista next_fixtures_view con quote medie per match
-    DROP VIEW IF EXISTS next_fixtures_view;
-
     CREATE VIEW next_fixtures_view AS
     SELECT
-        m.match_id,
-        m.date,
-        m.home_team_name,
-        m.away_team_name,
-        p.winner,
-        p.prob_home,
-        p.prob_draw,
-        p.prob_away,
+        m.match_id, m.date, m.round,
+        m.home_team_name, m.away_team_name,
+        p.winner, p.prob_home, p.prob_draw, p.prob_away,
         ROUND(AVG(CASE WHEN o.market = 'Match Winner' AND o.outcome = 'Home' THEN o.odd END), 2) AS avg_home_odd,
         ROUND(AVG(CASE WHEN o.market = 'Match Winner' AND o.outcome = 'Draw' THEN o.odd END), 2) AS avg_draw_odd,
         ROUND(AVG(CASE WHEN o.market = 'Match Winner' AND o.outcome = 'Away' THEN o.odd END), 2) AS avg_away_odd,
@@ -124,55 +68,35 @@ def create_views(conn):
     FROM matches m
     LEFT JOIN predictions p ON m.match_id = p.match_id
     LEFT JOIN odds o ON m.match_id = o.match_id
-    WHERE m.status = 'NS'
+    WHERE m.status IN ('NS', 'TBD', 'PST') AND date(m.date) <= date('now', '+14 days')
     GROUP BY m.match_id
     ORDER BY m.date ASC;
 
-
-    -- 3️⃣ Vista riepilogo infortuni
-    CREATE VIEW IF NOT EXISTS injury_summary_view AS
+    CREATE VIEW injury_summary_view AS
     SELECT
-        season,
-        t.name AS team_name,
+        m.season, m.round, t.name AS team_name,
         COUNT(i.id) AS total_injuries
     FROM injuries i
     JOIN matches m ON i.match_id = m.match_id
     JOIN teams t ON i.team_id = t.team_id
-    GROUP BY season, team_name;
+    GROUP BY m.season, m.round, team_name;
 
-    -- 4️⃣ Vista classifica leggibile
-    CREATE VIEW IF NOT EXISTS standings_view AS
+    CREATE VIEW standings_view AS
     SELECT
-        season,
-        league_id,
-        rank,
-        team_name,
-        points,
-        goals_for,
-        goals_against,
-        goals_diff,
-        form
+        season, league_id, rank, team_name, points,
+        goals_for, goals_against, goals_diff, form
     FROM standings
     ORDER BY season DESC, rank ASC;
 
-    -- 5️⃣ Vista posizioni giocatori
-    CREATE VIEW IF NOT EXISTS player_positions_view AS
-    SELECT
-        p.*,
-        l.position
+    CREATE VIEW player_positions_view AS
+    SELECT p.*, l.position
     FROM players p
-    LEFT JOIN lineups l
-    ON p.player_id = l.player_id AND p.match_id = l.match_id;
+    LEFT JOIN lineups l ON p.player_id = l.player_id AND p.match_id = l.match_id;
 
-    -- 6️⃣ Vista statistiche giocatori pulite
-    CREATE VIEW IF NOT EXISTS player_stats_clean_view AS
+    CREATE VIEW player_stats_clean_view AS
     SELECT
-        player_id,
-        match_id,
-        team_id,
-        player_name,
-        COALESCE(minutes, 0) AS minutes,
-        COALESCE(rating, 0) AS rating,
+        player_id, match_id, team_id, player_name,
+        COALESCE(minutes, 0) AS minutes, COALESCE(rating, 0) AS rating,
         COALESCE(shots_total, 0) AS shots_total,
         COALESCE(shots_on, 0) AS shots_on,
         COALESCE(goals_total, 0) AS goals_total,
@@ -186,30 +110,72 @@ def create_views(conn):
         COALESCE(yellow_cards, 0) AS yellow_cards,
         COALESCE(red_cards, 0) AS red_cards
     FROM players;
+                      
+    CREATE VIEW player_form_ranking AS
+    WITH player_stats AS (
+        SELECT
+            p.player_id,
+            p.player_name,
+            l.team_name,
+            l.position,
+            m.season,
+            COUNT(DISTINCT p.match_id) AS matches_played,
+            ROUND(AVG(p.rating), 2) AS avg_rating,
+            SUM(COALESCE(p.goals_total, 0)) AS goals,
+            SUM(COALESCE(p.assists, 0)) AS assists,
+            SUM(COALESCE(p.yellow_cards, 0)) AS yellows,
+            SUM(COALESCE(p.red_cards, 0)) AS reds
+        FROM players p
+        JOIN matches m ON p.match_id = m.match_id
+        JOIN lineups l ON p.match_id = l.match_id AND p.player_id = l.player_id
+        WHERE m.status = 'FT' AND m.season = 2025 AND p.rating IS NOT NULL
+        GROUP BY p.player_id, p.player_name, l.team_name, l.position, m.season
+    ),
+    recent_form AS (
+        SELECT
+            p.player_id,
+            ROUND(AVG(p.rating), 2) AS recent_avg
+        FROM players p
+        JOIN matches m ON p.match_id = m.match_id
+        WHERE m.status = 'FT' AND m.season = 2025 AND p.rating IS NOT NULL
+        GROUP BY p.player_id
+        HAVING COUNT(p.match_id) >= 3
+    )
+    SELECT
+        ps.player_id,
+        ps.player_name,
+        ps.team_name,
+        ps.position,
+        ps.season,
+        ps.matches_played,
+        ps.avg_rating,
+        ps.goals,
+        ps.assists,
+        ps.yellows,
+        ps.reds,
+        ROUND(COALESCE(rf.recent_avg - ps.avg_rating, 0), 2) AS form_trend,
+        CASE
+            WHEN ps.position = 'G' THEN ROUND((ps.avg_rating * 0.8) - (ps.reds * 0.05) - (ps.yellows * 0.02), 2)
+            WHEN ps.position = 'D' THEN ROUND((ps.avg_rating * 0.7) + (ps.goals * 0.1) + (ps.assists * 0.05) - (ps.reds * 0.05) - (ps.yellows * 0.02), 2)
+            WHEN ps.position = 'M' THEN ROUND((ps.avg_rating * 0.6) + (ps.goals * 0.15) + (ps.assists * 0.15) - (ps.reds * 0.05) - (ps.yellows * 0.02), 2)
+            WHEN ps.position = 'F' THEN ROUND((ps.avg_rating * 0.5) + (ps.goals * 0.25) + (ps.assists * 0.15) - (ps.reds * 0.05) - (ps.yellows * 0.02), 2)
+            ELSE ROUND((ps.avg_rating * 0.7) + (ps.goals * 0.1) + (ps.assists * 0.1), 2)
+        END AS performance_index
+    FROM player_stats ps
+    LEFT JOIN recent_form rf ON ps.player_id = rf.player_id
+    WHERE ps.matches_played >= 2
+    ORDER BY performance_index DESC;               
     """)
-
     conn.commit()
-    print("✅ Viste create.\n")
+    print("✅ Viste aggiornate.")
 
-# === MAIN ===
-def main():
-    print(f"🚀 Ottimizzazione database: {DB_PATH}\n")
-    backup_db()
+def optimize_database():
+    print("🔧 Ottimizzazione leggera post-update...")
     conn = connect_db()
-
-    # Rimozione colonne inutili
-    #drop_columns(conn, "matches", ["last_update"])
-    #drop_columns(conn, "teams", ["last_update"])
-    #drop_columns(conn, "players", ["position"])
-    #drop_columns(conn, "injuries", ["since", "expected_return"])
-    #drop_columns(conn, "odds", ["timestamp", "source"])
-
-    # Indici + viste
-    #create_indexes(conn)
+    create_indexes(conn)
     create_views(conn)
-
     conn.close()
-    print("🎯 Database ottimizzato e pronto all’uso!")
+    print("🎯 Ottimizzazione completata e DB aggiornato.")
 
 if __name__ == "__main__":
-    main()
+    optimize_database()
