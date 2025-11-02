@@ -1,6 +1,6 @@
 import sqlite3
 import requests
-from db import DB_PATH
+from legacy.db_init import DB_PATH
 from dotenv import load_dotenv
 import os
 import time

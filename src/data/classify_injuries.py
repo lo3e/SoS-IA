@@ -1,25 +1,32 @@
-import sqlite3
-from pathlib import Path
+# src/data/classify_injuries.py
+"""
+Classifica gli infortuni e crea/aggiorna la vista current_unavailable_players.
+Ora usa il DB_PATH del core.
+"""
 
-# === CONFIG ===
-DB_PATH = Path(r"C:\Users\brain\Documents\ProgettiPersonali\SoS-IA\DB\sos_ia.db")
+from src.core.config import DB_PATH
+from src.core.logger import get_logger
+import sqlite3
+
+logger = get_logger(__name__)
+
 
 def add_category_column(conn):
-    c = conn.cursor()
-    c.execute("PRAGMA table_info(injuries);")
-    cols = [row[1] for row in c.fetchall()]
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(injuries);")
+    cols = [row[1] for row in cur.fetchall()]
     if "category" not in cols:
-        print("🧩 Aggiungo colonna 'category' alla tabella injuries...")
-        c.execute("ALTER TABLE injuries ADD COLUMN category TEXT;")
+        logger.info("🧩 Aggiungo colonna 'category' alla tabella injuries...")
+        cur.execute("ALTER TABLE injuries ADD COLUMN category TEXT;")
         conn.commit()
     else:
-        print("✅ Colonna 'category' già presente.")
+        logger.info("✅ Colonna 'category' già presente.")
+
 
 def classify_injuries(conn):
-    print("🔍 Classifico gli infortuni per categoria...")
-    c = conn.cursor()
-
-    c.execute("""
+    logger.info("🔍 Classifico gli infortuni per categoria...")
+    cur = conn.cursor()
+    cur.execute("""
         UPDATE injuries
         SET category = CASE
             WHEN reason LIKE '%Injury%' OR reason LIKE '%Fracture%' OR reason LIKE '%Tendon%' OR
@@ -34,13 +41,14 @@ def classify_injuries(conn):
         END;
     """)
     conn.commit()
-    print("✅ Classificazione completata.")
+    logger.info("✅ Classificazione completata.")
+
 
 def create_view(conn):
-    print("🧱 Creo (o aggiorno) la vista current_unavailable_players basata su 'round'...")
-    c = conn.cursor()
-    c.execute("DROP VIEW IF EXISTS current_unavailable_players;")
-    c.execute("""
+    logger.info("🧱 Creo/aggiorno la vista current_unavailable_players...")
+    cur = conn.cursor()
+    cur.execute("DROP VIEW IF EXISTS current_unavailable_players;")
+    cur.execute("""
         CREATE VIEW current_unavailable_players AS
         WITH next_round AS (
             SELECT m.round
@@ -64,34 +72,35 @@ def create_view(conn):
         ORDER BY team_name, player_name;
     """)
     conn.commit()
-    print("✅ Vista 'current_unavailable_players' aggiornata con successo (basata su round).")
+    logger.info("✅ Vista 'current_unavailable_players' aggiornata.")
+
 
 def preview_unavailables(conn):
-    print("\n📋 Esempio giocatori indisponibili (partite future):")
-    c = conn.cursor()
-    c.execute("""
+    cur = conn.cursor()
+    cur.execute("""
         SELECT team_name, player_name, category, reason
         FROM current_unavailable_players
         LIMIT 20;
     """)
-    rows = c.fetchall()
+    rows = cur.fetchall()
     if not rows:
-        print("   Nessun giocatore indisponibile per le prossime partite.")
+        logger.info("   Nessun giocatore indisponibile per le prossime partite.")
     else:
         for team, player, cat, reason in rows:
-            print(f"   ⚽ {team:<20} | {player:<25} | {cat:<12} | {reason}")
+            logger.info(f"   ⚽ {team:<20} | {player:<25} | {cat:<12} | {reason}")
+
 
 def main():
-    print("🚀 Classificazione e vista indisponibili giocatori\n")
     conn = sqlite3.connect(DB_PATH)
     try:
         add_category_column(conn)
         classify_injuries(conn)
         create_view(conn)
         preview_unavailables(conn)
-        print("\n🎯 Operazione completata con successo.")
+        logger.info("🎯 Operazione infortuni completata.")
     finally:
         conn.close()
+
 
 if __name__ == "__main__":
     main()

@@ -1,20 +1,21 @@
-# === optimize_db.py ===
-import os
+# src/pipeline/optimize_db.py
+"""
+Ottimizzazione DB: indici + viste
+"""
+
+from src.core.config import DB_PATH
+from src.core.logger import get_logger
 import sqlite3
-from pathlib import Path
-from dotenv import load_dotenv
 
-load_dotenv()
+logger = get_logger(__name__)
 
-DB_PATH = os.getenv("DB_PATH")
-if not DB_PATH:
-    DB_PATH = Path(__file__).resolve().parent.parent / "data" / "sosia.db"
 
 def connect_db():
     return sqlite3.connect(DB_PATH)
 
+
 def create_indexes(conn):
-    print("⚙️ Aggiorno indici principali...")
+    logger.info("⚙️ Aggiorno indici principali...")
     cur = conn.cursor()
     indexes = [
         ("idx_matches_match_id", "matches", "match_id"),
@@ -29,11 +30,13 @@ def create_indexes(conn):
     for name, table, cols in indexes:
         cur.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({cols});")
     conn.commit()
-    print("✅ Indici aggiornati.")
+    logger.info("✅ Indici aggiornati.")
+
 
 def create_views(conn):
-    print("🧩 Ricreo viste logiche...")
+    logger.info("🧩 Ricreo viste logiche...")
     cur = conn.cursor()
+    # qui ho incollato la tua execscript pari pari (:contentReference[oaicite:3]{index=3})
     cur.executescript("""
     DROP VIEW IF EXISTS match_features_view;
     DROP VIEW IF EXISTS next_fixtures_view;
@@ -164,18 +167,21 @@ def create_views(conn):
     FROM player_stats ps
     LEFT JOIN recent_form rf ON ps.player_id = rf.player_id
     WHERE ps.matches_played >= 2
-    ORDER BY performance_index DESC;               
+    ORDER BY performance_index DESC;
     """)
+
     conn.commit()
-    print("✅ Viste aggiornate.")
+    logger.info("✅ Viste aggiornate.")
+
 
 def optimize_database():
-    print("🔧 Ottimizzazione leggera post-update...")
+    logger.info("🔧 Ottimizzazione leggera post-update...")
     conn = connect_db()
     create_indexes(conn)
     create_views(conn)
     conn.close()
-    print("🎯 Ottimizzazione completata e DB aggiornato.")
+    logger.info("🎯 Ottimizzazione completata e DB aggiornato.")
+
 
 if __name__ == "__main__":
     optimize_database()

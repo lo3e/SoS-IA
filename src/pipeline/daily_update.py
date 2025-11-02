@@ -1,24 +1,29 @@
-# src/daily_update.py
+# src/pipeline/daily_update.py
 import os
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import requests
-from pathlib import Path
 from dotenv import load_dotenv
-from classify_injuries import classify_injuries
-from optimize_db import optimize_database
+
+# <-- NUOVI IMPORT DAL CORE/NUOVI MODULI -->
+from src.core.config import DB_PATH
+from src.core.logger import get_logger
+from src.data.classify_injuries import add_category_column, classify_injuries, create_view
+from src.pipeline.optimize_db import optimize_database
+from src.data.prepare_training_data_v2 import build_dataset
+from src.training.train_model_optimized import train_with_cutoff
+from src.evaluation.evaluate_2025 import evaluate_on_round
+from src.betting.bolletta import generate_for_round
 
 load_dotenv()
+logger = get_logger(__name__)
 
 API_KEY = os.getenv("API_FOOTBALL_KEY")
-DB_PATH = os.getenv("DB_PATH")
-if not DB_PATH:
-    DB_PATH = Path(__file__).resolve().parent.parent / "data" / "sosia.db"
-
 if not API_KEY:
-    raise ValueError("❌ API_FOOTBALL_KEY mancante nel .env")
+    raise ValueError("API_FOOTBALL_KEY mancante nel .env")
 
 BASE_URL = "https://v3.football.api-sports.io"
 HEADERS = {"x-apisports-key": API_KEY}
@@ -28,32 +33,32 @@ DAYS_AHEAD = 14  # orizzonte partite future
 
 
 # ---------------------------------------------------------
-# utility
+# utility API
 # ---------------------------------------------------------
 def call_api(endpoint: str, params: dict = None):
     url = f"{BASE_URL}{endpoint}"
     try:
         r = requests.get(url, headers=HEADERS, params=params or {}, timeout=25)
         if r.status_code == 429:
-            print("🚫 Rate limit raggiunto.")
+            logger.warning("🚫 Rate limit raggiunto.")
             return None
         r.raise_for_status()
         return r.json().get("response", [])
     except Exception as e:
-        print(f"⚠️ Errore API {endpoint}: {e}")
+        logger.exception(f"Errore API {endpoint}: {e}")
         return None
 
 
-def connect_db():
-    return sqlite3.connect(DB_PATH)
+def current_season() -> int:
+    # API-Football usa anno solare
+    return datetime.now(timezone.utc).year
+
 
 # ---------------------------------------------------------
-# 1) aggiorna fixtures future (NS) entro N giorni
+# 1) fixtures da aggiornare
 # ---------------------------------------------------------
 def update_fixtures(conn):
     c = conn.cursor()
-
-    # 1️⃣ Seleziono tutte le partite non finite o recenti (ultimi 3 giorni)
     c.execute("""
         SELECT match_id, date
         FROM matches
@@ -62,7 +67,7 @@ def update_fixtures(conn):
     """)
     rows = c.fetchall()
     if not rows:
-        print("📭 Nessuna fixture da aggiornare.")
+        logger.info("📭 Nessuna fixture da aggiornare.")
         return
 
     now = datetime.now(timezone.utc)
@@ -73,17 +78,16 @@ def update_fixtures(conn):
             continue
         try:
             dt = datetime.fromisoformat(date_str.replace("Z", "")).replace(tzinfo=timezone.utc)
-            # includiamo partite negli ultimi 3 giorni e nei prossimi DAYS_AHEAD
             delta_days = (dt - now).days
             if -3 <= delta_days <= DAYS_AHEAD:
                 to_update.append(match_id)
         except Exception:
             continue
 
-    print(f"📅 Fixtures da aggiornare (-3 → +{DAYS_AHEAD} giorni): {len(to_update)}")
+    logger.info(f"📅 Fixtures da aggiornare (-3 → +{DAYS_AHEAD} giorni): {len(to_update)}")
 
     for idx, fixture_id in enumerate(to_update, start=1):
-        print(f"  ({idx}/{len(to_update)}) 🔁 fixture {fixture_id}")
+        logger.info(f"  ({idx}/{len(to_update)}) 🔁 fixture {fixture_id}")
         data = call_api("/fixtures", {"id": fixture_id})
         if not data:
             continue
@@ -101,10 +105,10 @@ def update_fixtures(conn):
             fixture.get("status", {}).get("short"),
             goals.get("home"),
             goals.get("away"),
-            fixture_id
+            fixture_id,
         ))
 
-        # se la partita è finita → aggiorna anche stats, eventi, lineups, players
+        # se è FT → scarico stats/eventi/lineups/players
         if fixture.get("status", {}).get("short") == "FT":
             insert_team_stats(conn, fixture_id)
             insert_events(conn, fixture_id)
@@ -114,20 +118,18 @@ def update_fixtures(conn):
         time.sleep(SLEEP_TIME)
 
     conn.commit()
-    print("✅ Fixtures aggiornate correttamente.")
-
+    logger.info("✅ Fixtures aggiornate correttamente.")
 
 
 # ---------------------------------------------------------
-# 2) standings aggiornati
+# 2) standings
 # ---------------------------------------------------------
 def update_standings(conn):
     data = call_api("/standings", {"league": LEAGUE_ID, "season": current_season()})
     if not data:
-        print("⚠️ Nessuna standings aggiornata.")
+        logger.warning("⚠️ Nessuna standings aggiornata.")
         return
     c = conn.cursor()
-    # cancello standings per la stagione corrente e riscrivo
     c.execute("DELETE FROM standings WHERE season = ?", (current_season(),))
 
     standings_list = data[0].get("league", {}).get("standings", [[]])[0]
@@ -154,21 +156,20 @@ def update_standings(conn):
             stats.get("draw"),
             stats.get("lose"),
             stats.get("goals", {}).get("for"),
-            stats.get("goals", {}).get("against")
+            stats.get("goals", {}).get("against"),
         ))
 
     conn.commit()
-    print("✅ Standings aggiornate.")
+    logger.info("✅ Standings aggiornate.")
 
 
 # ---------------------------------------------------------
-# 3) injuries del giorno (solo se nuovi)
+# 3) injuries
 # ---------------------------------------------------------
 def update_injuries(conn):
-    # prendiamo solo quelli della stagione corrente
     data = call_api("/injuries", {"league": LEAGUE_ID, "season": current_season()})
     if not data:
-        print("⚠️ Nessun infortunio nuovo.")
+        logger.info("⚠️ Nessun infortunio nuovo.")
         return
 
     c = conn.cursor()
@@ -178,7 +179,6 @@ def update_injuries(conn):
         player_id = inj.get("player", {}).get("id")
         team_id = inj.get("team", {}).get("id")
 
-        # check: se esiste già, skip
         c.execute("""
             SELECT 1 FROM injuries
             WHERE match_id = ? AND player_id = ? AND team_id = ?
@@ -195,13 +195,18 @@ def update_injuries(conn):
             player_id,
             inj.get("player", {}).get("name"),
             team_id,
-            inj.get("player", {}).get("reason")
+            inj.get("player", {}).get("reason"),
         ))
         inserted += 1
 
     conn.commit()
+
+    # <-- QUI USIAMO IL NUOVO MODULO DI CLASSIFICAZIONE -->
+    add_category_column(conn)
     classify_injuries(conn)
-    print(f"✅ Infortuni aggiornati (+{inserted} nuovi)")
+    create_view(conn)
+
+    logger.info(f"✅ Infortuni aggiornati (+{inserted} nuovi)")
 
 
 # ---------------------------------------------------------
@@ -216,7 +221,7 @@ def update_prematch_odds(conn, days_ahead=DAYS_AHEAD):
     """)
     rows = c.fetchall()
     if not rows:
-        print("📭 Nessuna partita NS trovata.")
+        logger.info("📭 Nessuna partita NS trovata.")
         return
 
     now = datetime.now(timezone.utc)
@@ -231,35 +236,34 @@ def update_prematch_odds(conn, days_ahead=DAYS_AHEAD):
         except Exception:
             continue
 
-    print(f"🎯 Partite NS entro {days_ahead} giorni: {len(upcoming)}")
+    logger.info(f"🎯 Partite NS entro {days_ahead} giorni: {len(upcoming)}")
 
     for idx, (match_id, match_date) in enumerate(upcoming, start=1):
-        # se abbiamo già odds per questo match, skip
         c.execute("SELECT COUNT(*) FROM odds WHERE match_id = ?", (match_id,))
         if c.fetchone()[0] > 0:
-            print(f"  ({idx}/{len(upcoming)}) 🔁 odds già presenti per {match_id} → skip")
+            logger.info(f"  ({idx}/{len(upcoming)}) 🔁 odds già presenti per {match_id} → skip")
             continue
 
-        print(f"  ({idx}/{len(upcoming)}) 📡 scarico odds per {match_id} ({match_date.date()})")
+        logger.info(f"  ({idx}/{len(upcoming)}) 📡 scarico odds per {match_id} ({match_date.date()})")
         odds_data = call_api("/odds", {"fixture": match_id})
         if odds_data is None:
-            print("   🚫 stop per limite API")
+            logger.warning("🚫 stop per limite API")
             break
         save_odds(conn, match_id, odds_data)
         time.sleep(SLEEP_TIME)
 
-    print("✅ Odds pre-match aggiornate.")
+    logger.info("✅ Odds pre-match aggiornate.")
 
 
 # ---------------------------------------------------------
-# 5) stats, events, players, lineups per match (riuso di quelle del fetch grande)
+# 5) dettagli match (stats / events / lineups / players)
+#    (ripresi pari pari dal tuo file originale)
 # ---------------------------------------------------------
 def insert_team_stats(conn, fixture_id):
     data = call_api("/fixtures/statistics", {"fixture": fixture_id})
     if not data:
         return
     c = conn.cursor()
-    # cancelliamo e riscriviamo per quella partita
     c.execute("DELETE FROM team_stats WHERE match_id = ?", (fixture_id,))
     for team_block in data:
         team_id = team_block.get("team", {}).get("id")
@@ -273,7 +277,7 @@ def insert_team_stats(conn, fixture_id):
                 team_id,
                 team_name,
                 stat.get("type"),
-                str(stat.get("value")) if stat.get("value") is not None else None
+                str(stat.get("value")) if stat.get("value") is not None else None,
             ))
     conn.commit()
 
@@ -300,7 +304,7 @@ def insert_events(conn, fixture_id):
             ev.get("assist", {}).get("name"),
             ev.get("type"),
             ev.get("detail"),
-            ev.get("comments")
+            ev.get("comments"),
         ))
     conn.commit()
 
@@ -319,9 +323,10 @@ def insert_lineups(conn, fixture_id):
         for player in team_block.get("startXI", []):
             p = player.get("player", {})
             c.execute("""
-                INSERT INTO lineups (match_id, team_id, team_name, formation, coach_name,
-                                     player_id, player_name, position, is_starter)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+                INSERT INTO lineups (
+                    match_id, team_id, team_name, formation, coach_name,
+                    player_id, player_name, position, is_starter
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
             """, (
                 fixture_id,
                 team.get("id"),
@@ -330,15 +335,16 @@ def insert_lineups(conn, fixture_id):
                 coach.get("name"),
                 p.get("id"),
                 p.get("name"),
-                p.get("pos")
+                p.get("pos"),
             ))
         # panchina
         for player in team_block.get("substitutes", []):
             p = player.get("player", {})
             c.execute("""
-                INSERT INTO lineups (match_id, team_id, team_name, formation, coach_name,
-                                     player_id, player_name, position, is_starter)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+                INSERT INTO lineups (
+                    match_id, team_id, team_name, formation, coach_name,
+                    player_id, player_name, position, is_starter
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
             """, (
                 fixture_id,
                 team.get("id"),
@@ -347,7 +353,7 @@ def insert_lineups(conn, fixture_id):
                 coach.get("name"),
                 p.get("id"),
                 p.get("name"),
-                p.get("pos")
+                p.get("pos"),
             ))
     conn.commit()
 
@@ -396,50 +402,8 @@ def insert_players(conn, fixture_id):
             ))
     conn.commit()
 
-# ---------------------------------------------------------
-# 6) aggiorna il campo "round" (giornata di campionato)
-# ---------------------------------------------------------
-def update_rounds(conn):
-    c = conn.cursor()
-    # prendo stagioni distinte già presenti nel DB
-    c.execute("SELECT DISTINCT season FROM matches ORDER BY season;")
-    seasons = [row[0] for row in c.fetchall()]
-    print(f"🏁 Aggiornamento round per stagioni: {seasons}")
-
-    for season in seasons:
-        print(f"📅 Aggiorno round per stagione {season}...")
-        fixtures = call_api("/fixtures", {"league": LEAGUE_ID, "season": season})
-        if not fixtures:
-            print(f"⚠️ Nessun dato API per stagione {season}.")
-            continue
-
-        updated = 0
-        for fx in fixtures:
-            match_id = fx.get("fixture", {}).get("id")
-            round_val = fx.get("league", {}).get("round")
-            if not match_id or not round_val:
-                continue
-            c.execute("UPDATE matches SET round = ? WHERE match_id = ?", (round_val, match_id))
-            updated += 1
-
-        conn.commit()
-        print(f"   ✅ {updated} match aggiornati per stagione {season}")
-
-    print("✅ Round aggiornati correttamente.")
-
-# ---------------------------------------------------------
-# helper
-# ---------------------------------------------------------
-def current_season():
-    # oggi è 2025-10 → siamo nella stagione 2025
-    today = datetime.now(timezone.utc)
-    year = today.year
-    # se siamo in estate puoi aggiungere logica, ma per la Serie A è 1:1
-    return year
-
 
 def save_odds(conn, match_id, odds_data):
-    """stessa logica del fetch_api_data.py, ma per fixture singolo"""
     if not odds_data:
         return
     c = conn.cursor()
@@ -466,22 +430,106 @@ def save_odds(conn, match_id, odds_data):
 
 
 # ---------------------------------------------------------
+# funzioni di supporto per ML
+# ---------------------------------------------------------
+def get_last_completed_round(conn, season: int):
+    c = conn.cursor()
+    c.execute("""
+        SELECT round
+        FROM matches
+        WHERE season = ? AND status = 'FT'
+        GROUP BY round
+        ORDER BY MAX(date) DESC
+        LIMIT 1;
+    """, (season,))
+    row = c.fetchone()
+    return row[0] if row else None
+
+
+def get_next_round(conn, season: int):
+    c = conn.cursor()
+    c.execute("""
+        SELECT round
+        FROM matches
+        WHERE season = ? AND status = 'NS'
+        ORDER BY date ASC
+        LIMIT 1;
+    """, (season,))
+    row = c.fetchone()
+    return row[0] if row else None
+
+
+def round_to_int(round_str: str | None) -> int | None:
+    if not round_str:
+        return None
+    parts = round_str.split("-")
+    try:
+        return int(parts[-1].strip())
+    except ValueError:
+        return None
+
+
+# ---------------------------------------------------------
 # main
 # ---------------------------------------------------------
 def main():
-    conn = connect_db()
-    print("🚀 Avvio aggiornamento giornaliero Serie A")
+    logger.info("🚀 Avvio DAILY UPDATE SoS-IA")
+
+    # 1) aggiornamento dati da API -> DB
+    conn = sqlite3.connect(DB_PATH)
     update_fixtures(conn)
-    update_rounds(conn)
     update_standings(conn)
     update_injuries(conn)
     update_prematch_odds(conn, days_ahead=DAYS_AHEAD)
     conn.close()
-    print("✅ Aggiornamento completato.")
+    logger.info("✅ Aggiornamento API → DB completato.")
 
-    # Ottimizza DB dopo aggiornamenti
-    print("\n🧠 Ottimizzo e ricreo viste post-aggiornamento...")
+    # 2) Ottimizza DB dopo aggiornamenti
+    logger.info("🧠 Ottimizzo e ricreo viste post-aggiornamento...")
     optimize_database()
+
+    # 3) --- PARTE ML NUOVA ---
+    conn = sqlite3.connect(DB_PATH)
+    season = current_season()
+
+    last_round_str = get_last_completed_round(conn, season)
+    next_round_str = get_next_round(conn, season)
+    conn.close()
+
+    last_round_int = round_to_int(last_round_str) if last_round_str else None
+    next_round_int = round_to_int(next_round_str) if next_round_str else None
+
+    if last_round_int and last_round_int > 2:
+        cutoff_round = last_round_int - 2  # allena fino a due giornate prima
+        eval_round = last_round_int - 1    # valuta sulla penultima
+    else:
+        cutoff_round = None
+        eval_round = None
+
+    logger.info(f"📐 ML: cutoff={cutoff_round}, eval_round={eval_round}, next_round={next_round_int}")
+
+    # 3a) rigenero dataset
+    build_dataset(min_season=2021, max_season=season, cutoff_round=cutoff_round)
+    _, dataset_path = build_dataset(min_season=2021, max_season=current_season(), cutoff_round=cutoff_round)
+
+    # 3b) training
+    model_path, meta_path = train_with_cutoff(cutoff_round=cutoff_round, min_season=2021, dataset_path=dataset_path)
+
+    # 3c) evaluation
+    if eval_round:
+        evaluate_on_round(round_number=eval_round, season=season)
+    else:
+        logger.warning("⚠️ Nessun round di valutazione disponibile (stagione troppo all’inizio).")
+
+    # 3d) bolletta
+    if next_round_int:
+        generate_for_round(next_round_int, season=season, mode="pure", model_path=model_path)
+        generate_for_round(next_round_int, season=season, mode="value", model_path=model_path)
+    else:
+        logger.warning("⚠️ Nessuna prossima giornata trovata per generare la bolletta.")
+
+    logger.info("✅ DAILY UPDATE SoS-IA COMPLETATO.")
+
 
 if __name__ == "__main__":
     main()
