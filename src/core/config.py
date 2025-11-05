@@ -51,3 +51,47 @@ if __name__ == "__main__":
     print("✅ Config caricata con successo:")
     for k, v in project_info().items():
         print(f"{k:12s} → {v}")
+
+# ============================================================
+# FEATURE & TRAINING CONFIGURATION
+# ============================================================
+
+FEATURE_CONFIG = {
+    # Colonne da escludere prima del training o della valutazione
+    "exclude_cols": [
+        "match_id", "home_team_id", "away_team_id", "date",
+        "home_team_name", "away_team_name", "home_season",
+        "away_season", "status", "home_goals", "away_goals",
+        "label_result", "round", "round_number", "season",
+        "home_form", "away_form", "form", "away_valid_round",
+        "home_valid_round"
+    ],
+
+    # Classi possibili del modello
+    "valid_classes": ["H", "D", "A"]
+}
+
+# ============================================================
+# HELPER FUNCTION: compute_result
+# ============================================================
+
+def compute_result(row) -> str:
+    """Calcola il risultato (label) di una partita: H, D, A."""
+    try:
+        if row["home_goals"] > row["away_goals"]:
+            return "H"
+        elif row["home_goals"] < row["away_goals"]:
+            return "A"
+        else:
+            return "D"
+    except Exception:
+        return "D"
+
+# --- Model training configuration ---
+MODEL_CONFIG = {
+    # Nome base del file usato per salvare la lista di feature del modello
+    "feature_list_prefix": "features_",
+    "feature_list_ext": ".txt",
+    # Nome del file JSON con metadati opzionali
+    "metadata_ext": ".json",
+}

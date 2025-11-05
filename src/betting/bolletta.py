@@ -1,68 +1,59 @@
 # src/betting/bolletta.py
 """
-Generatore di schedine per SoS-IA (Serie A e altri campionati).
+Generatore di schedine per SoS-IA.
 
 Produce:
-- schedina "pura" → previsione più probabile (Home / Draw / Away)
-- schedina "value bet" → solo match in cui la probabilità modello > implicita quota
+- schedina "pura"  → previsione più probabile (Home / Draw / Away)
+- schedina "value" → solo match dove la probabilità del modello è > probabilità implicita della quota
 
-Compatibile con il nuovo core e con i moduli di training/evaluation.
+È allineato con:
+- prepare_training_data_v2 (stesse feature base)
+- evaluate_2025 (stessa normalizzazione)
+- train_model_optimized (usa FEATURE_CONFIG per scegliere le colonne)
 """
 
 import os
-import json
-import joblib
-import pandas as pd
-import numpy as np
 from datetime import datetime
 
-from src.core.config import PATHS
+import joblib
+import numpy as np
+import pandas as pd
+
+from src.core.config import PATHS, FEATURE_CONFIG, MODEL_CONFIG
 from src.core.db import fetch_df
 from src.core.logger import get_logger
+from src.features.feature_engineering import compute_features  # usiamo la stessa funzione degli altri
 
 logger = get_logger(__name__)
 
-# =========================================================
-# ⚙️ Funzioni principali
-# =========================================================
-def generate_for_round(round_number: int, season: int = 2025, mode: str = "pure", model_path: str | None = None) -> str:
+
+def _load_model(model_path: str | None = None) -> tuple[object, str]:
     """
-    Genera la schedina per una giornata specifica.
-
-    Args:
-        round_number (int): numero del turno da pronosticare
-        season (int): stagione (default 2025)
-        mode (str): "pure" per pronostico puro, "value" per value bet
-
-    Returns:
-        str: percorso del file CSV salvato
+    Carica il modello. Se non viene passato un path, prende l'ultimo .pkl in PATHS["models"].
     """
-
-    logger.info(f"🎯 Generazione bolletta: stagione {season}, round {round_number}, modalità {mode}")
-
-    # ------------------------------
-    # 1️⃣ Carico modello più recente
-    # ------------------------------
-        # ------------------------------
-    # modello
-    # ------------------------------
     if model_path is None:
-        # fallback: prendo comunque l’ultimo disponibile
         model_dir = PATHS["models"]
         models = [f for f in os.listdir(model_dir) if f.endswith(".pkl")]
         if not models:
             raise FileNotFoundError("❌ Nessun modello trovato in models/.")
+        # ordino per data di modifica, più recente per primo
         models.sort(key=lambda f: os.path.getmtime(os.path.join(model_dir, f)), reverse=True)
         model_path = os.path.join(model_dir, models[0])
-        logger.info(f"📦 Modello (fallback) caricato: {os.path.basename(model_path)}")
+        logger.info("📦 Modello (fallback) caricato: %s", os.path.basename(model_path))
     else:
-        logger.info(f"📦 Modello (passato dal daily) caricato: {os.path.basename(model_path)}")
+        logger.info("📦 Modello (passato dal daily) caricato: %s", os.path.basename(model_path))
 
     model = joblib.load(model_path)
+    return model, model_path
 
-    # ------------------------------
-    # 2️⃣ Query prossime partite
-    # ------------------------------
+
+def _fetch_fixtures_with_context(season: int, round_number: int) -> pd.DataFrame:
+    """
+    Recupera dal DB le partite non iniziate di quel turno con:
+    - prob API
+    - odds aggregate
+    - standings (punti, rank, form)
+    """
     query = f"""
         SELECT 
             m.match_id, m.date, m.round, m.season,
@@ -71,7 +62,7 @@ def generate_for_round(round_number: int, season: int = 2025, mode: str = "pure"
             o.odd_home, o.odd_draw, o.odd_away,
             sh.points AS home_points, sa.points AS away_points,
             sh.rank AS home_rank, sa.rank AS away_rank,
-            sh.form AS form_home, sa.form AS form_away
+            sh.form AS home_form, sa.form AS away_form
         FROM matches m
         LEFT JOIN predictions p ON m.match_id = p.match_id
         LEFT JOIN (
@@ -88,151 +79,177 @@ def generate_for_round(round_number: int, season: int = 2025, mode: str = "pure"
           AND m.round = 'Regular Season - {round_number}'
           AND m.status IN ('NS', 'TBD', 'PST')
     """
-    fixtures = fetch_df(query)
-    if fixtures.empty:
+    df = fetch_df(query)
+
+    if df.empty:
         raise ValueError(f"⚠️ Nessuna partita trovata per il round {round_number}")
 
-    logger.info(f"📅 Partite trovate: {len(fixtures)}")
+    # aggiungo round_progress esattamente come in evaluate
+    try:
+        max_round_db = fetch_df(
+            f"""
+            SELECT MAX(CAST(SUBSTR(round, INSTR(round, '-') + 1) AS INTEGER)) AS max_r
+            FROM matches
+            WHERE season = {season}
+            """
+        )["max_r"].iloc[0]
+        if not max_round_db or max_round_db == 0:
+            max_round_db = round_number
+    except Exception:
+        max_round_db = round_number
 
-    # ------------------------------
-    # 3️⃣ Predizioni del modello
-    # ------------------------------
-    features = ["prob_home", "prob_draw", "prob_away"]  # se servono altre feature, si estende
-    X_pred = fixtures[features].copy()
+    df["round_progress"] = round_number / max_round_db
 
-    # 🧹 normalizzo le probabilità che arrivano dall’API (tipo "63%")
-    for col in ["prob_home", "prob_draw", "prob_away"]:
-        if col in X_pred.columns:
-            X_pred[col] = (
-                X_pred[col]
-                .astype(str)
-                .str.replace("%", "", regex=False)
-                .astype(float)
-                / 100
-            )
+    return df
 
-        # ------------------------------
-    # 🧹 Normalizzazione e feature engineering come in training/evaluate
-    # ------------------------------
 
-    # 1️⃣ Conversione percentuali (es. "65%") in float
-    for col in ["prob_home", "prob_away", "prob_draw"]:
-        if col in fixtures.columns:
-            fixtures[col] = (
-                fixtures[col]
-                .astype(str)
-                .str.replace("%", "", regex=False)
-                .astype(float)
-                / 100
-            )
+def _probs_from_model(model, X: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ottiene le proba dal modello e le rimappa sempre su Home/Draw/Away
+    in base a model.classes_ (così non sbagliamo l'ordine).
+    """
+    proba = model.predict_proba(X)
+    classes = list(model.classes_)  # es. ["A","D","H"] o ["H","D","A"]
 
-    # 2️⃣ Conversione forma in indice numerico
-    def encode_form(form_string):
-        mapping = {"W": 3, "D": 1, "L": 0}
-        if not isinstance(form_string, str):
-            return 0.0
-        values = [mapping.get(ch, 0) for ch in form_string if ch in mapping]
-        return np.mean(values) if values else 0.0
+    # inizializzo con NaN
+    out = pd.DataFrame(index=X.index, columns=["p_home", "p_draw", "p_away"], dtype=float)
 
-    if "form_home" in fixtures.columns:
-        fixtures["home_form_index"] = fixtures["form_home"].apply(encode_form)
+    for i, cls in enumerate(classes):
+        if cls in ("H", "Home"):
+            out["p_home"] = proba[:, i]
+        elif cls in ("D", "Draw"):
+            out["p_draw"] = proba[:, i]
+        elif cls in ("A", "Away"):
+            out["p_away"] = proba[:, i]
+
+    # se qualcuna è rimasta vuota, la metto a 0
+    out = out.fillna(0.0)
+    return out
+
+
+def generate_for_round(
+    round_number: int,
+    season: int = 2025,
+    mode: str = "pure",
+    model_path: str | None = None,
+) -> str:
+    """
+    Genera la schedina per una giornata specifica.
+    mode:
+      - "pure"  → previsione più probabile
+      - "value" → filtra solo le value bet
+    """
+    logger.info("🎯 Generazione bolletta: stagione %s, round %s, modalità %s", season, round_number, mode)
+
+    # 1) modello
+    model, used_model_path = _load_model(model_path)
+
+    # 2) partite
+    fixtures = _fetch_fixtures_with_context(season, round_number)
+    logger.info("📅 Partite trovate: %s", len(fixtures))
+
+    # 3) normalizzazione e feature engineering identica al resto
+    #    (usa la funzione comune che abbiamo messo in src.features.feature_engineering)
+    fixtures = compute_features(fixtures, mode="predict", season=season)  # crea home_form_index, diff, balance, ecc.
+
+    # 4) preparo X con le stesse colonne usate in training
+    #    NB: togliamo anche home_form / away_form perché sono stringhe
+    exclude_cols = FEATURE_CONFIG["exclude_cols"]
+    feature_cols = [c for c in fixtures.columns if c not in exclude_cols]
+
+    # 🧭 Allineamento colonne con quelle del modello
+    feature_list_path = os.path.join(
+        os.path.dirname(used_model_path),
+        f"{MODEL_CONFIG['feature_list_prefix']}{os.path.basename(used_model_path).replace('.pkl', '')}{MODEL_CONFIG['feature_list_ext']}"
+    )
+
+    if os.path.exists(feature_list_path):
+        with open(feature_list_path, "r", encoding="utf-8") as f:
+            model_features = [line.strip() for line in f.readlines() if line.strip()]
+        # tieni solo le colonne comuni e nell'ordine corretto
+        X_pred = fixtures[feature_cols].fillna(0)
+        X_pred = X_pred.reindex(columns=model_features, fill_value=0)
+        logger.info(f"✅ Colonne allineate al modello ({len(model_features)} features).")
     else:
-        fixtures["home_form_index"] = 0.0
+        logger.warning("⚠️ Feature list non trovata, si usa X_pred come attuale (potrebbe causare mismatch).")
 
-    if "form_away" in fixtures.columns:
-        fixtures["away_form_index"] = fixtures["form_away"].apply(encode_form)
-    else:
-        fixtures["away_form_index"] = 0.0
+    # 5) predizioni
+    proba_df = _probs_from_model(model, X_pred)
+    fixtures = pd.concat([fixtures, proba_df], axis=1)
 
-    # 3️⃣ Feature derivate
-    fixtures["points_diff"] = fixtures["home_points"] - fixtures["away_points"]
-    fixtures["rank_diff"] = fixtures["home_rank"] - fixtures["away_rank"]
-    fixtures["form_diff"] = fixtures["home_form_index"] - fixtures["away_form_index"]
-
-    # equilibrio
-    fixtures["expected_draw_tendency"] = 1 - abs(fixtures["prob_home"] - fixtures["prob_away"])
-    fixtures["rank_balance"] = 1 / (1 + abs(fixtures["rank_diff"]))
-    fixtures["points_balance"] = 1 / (1 + abs(fixtures["points_diff"]))
-    fixtures["form_balance"] = 1 / (1 + abs(fixtures["form_diff"]))
-
-    logger.info("🔁 Feature numeriche e derivate calcolate correttamente per la bolletta.")
-
-    # 4️⃣ Preparo X_pred con lo stesso schema del modello
-    feature_cols = [
-        "prob_home", "prob_draw", "prob_away",
-        "home_points", "away_points", "points_diff",
-        "home_rank", "away_rank", "rank_diff",
-        "home_form_index", "away_form_index", "form_diff",
-        "expected_draw_tendency", "rank_balance", "points_balance", "form_balance"
-    ]
-    X_pred = fixtures[feature_cols].fillna(0)
-        
-    preds = model.predict_proba(X_pred)
-    preds_df = pd.DataFrame(preds, columns=["p_away", "p_draw", "p_home"])  # RF è inverso nei classi a volte
-    fixtures = pd.concat([fixtures, preds_df], axis=1)
-
-    # ------------------------------
-    # 4️⃣ Pronostico puro
-    # ------------------------------
-    def get_prediction_label(row):
-        probs = {"Home": row["p_home"], "Draw": row["p_draw"], "Away": row["p_away"]}
+    # 6) pronostico puro (scegliamo la max)
+    def _best_label(row: pd.Series) -> str:
+        probs = {
+            "Home": row.get("p_home", 0.0),
+            "Draw": row.get("p_draw", 0.0),
+            "Away": row.get("p_away", 0.0),
+        }
         return max(probs, key=probs.get)
 
-    fixtures["prediction"] = fixtures.apply(get_prediction_label, axis=1)
+    fixtures["prediction"] = fixtures.apply(_best_label, axis=1)
     fixtures["confidence"] = fixtures[["p_home", "p_draw", "p_away"]].max(axis=1)
 
-    # ------------------------------
-    # 5️⃣ Value bet (se richiesta)
-    # ------------------------------
+    # 7) modalità value bet
     if mode == "value":
-        def value_bet(row):
+        def _value_pick(row: pd.Series) -> str | None:
+            # se non ho quote non posso fare value bet
             if pd.isna(row["odd_home"]) or pd.isna(row["odd_draw"]) or pd.isna(row["odd_away"]):
                 return None
-            implied_probs = {
+
+            implied = {
                 "Home": 1 / row["odd_home"] if row["odd_home"] else 0,
                 "Draw": 1 / row["odd_draw"] if row["odd_draw"] else 0,
                 "Away": 1 / row["odd_away"] if row["odd_away"] else 0,
             }
-            pred_probs = {"Home": row["p_home"], "Draw": row["p_draw"], "Away": row["p_away"]}
-            value = {
-                k: (pred_probs[k] / implied_probs[k]) if implied_probs[k] > 0 else 0
-                for k in pred_probs
+            model_p = {
+                "Home": row.get("p_home", 0.0),
+                "Draw": row.get("p_draw", 0.0),
+                "Away": row.get("p_away", 0.0),
             }
-            best = max(value, key=value.get)
-            if value[best] > 1.1:  # threshold value bet
+
+            # rapporto valore
+            value_ratio = {}
+            for k in ("Home", "Draw", "Away"):
+                if implied[k] > 0:
+                    value_ratio[k] = model_p[k] / implied[k]
+                else:
+                    value_ratio[k] = 0.0
+
+            best = max(value_ratio, key=value_ratio.get)
+
+            # soglia semplice: 10% di overvalue
+            if value_ratio[best] > 1.1:
                 return best
             return None
 
-        fixtures["value_bet"] = fixtures.apply(value_bet, axis=1)
-        fixtures = fixtures[fixtures["value_bet"].notnull()]
-        fixtures.rename(columns={"value_bet": "prediction"}, inplace=True)
-        logger.info(f"💰 Value bets trovate: {len(fixtures)}")
+        fixtures["value_bet"] = fixtures.apply(_value_pick, axis=1)
+        fixtures = fixtures[fixtures["value_bet"].notnull()].copy()
+        fixtures["prediction"] = fixtures["value_bet"]
+        fixtures.drop(columns=["value_bet"], inplace=True)
+        logger.info("💰 Value bets trovate: %s", len(fixtures))
 
-    # ------------------------------
-    # 6️⃣ Output finale
-    # ------------------------------
+    # 8) costruisco output leggibile
     fixtures["output"] = fixtures.apply(
         lambda r: f"{r['home_team_name']} vs {r['away_team_name']} → {r['prediction']} ({r['confidence']:.2f})",
         axis=1
     )
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_name = f"bolletta_{mode}_{season}_R{round_number}_{timestamp}.csv"
-    out_path = os.path.join(PATHS["reports"], out_name)
+    # 9) salvo
     os.makedirs(PATHS["reports"], exist_ok=True)
-    fixtures.to_csv(out_path, index=False)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_name = f"bolletta_{mode}_{season}_R{round_number}_{ts}.csv"
+    out_path = os.path.join(PATHS["reports"], out_name)
+    fixtures.to_csv(out_path, index=False, encoding="utf-8")
 
-    logger.info(f"✅ Bolletta salvata in: {out_path}")
+    logger.info("✅ Bolletta salvata in: %s", out_path)
     logger.info("\n" + "\n".join(fixtures["output"].tolist()))
+    logger.info("📦 Modello usato: %s", os.path.basename(used_model_path))
 
     return out_path
 
 
-# =========================================================
-# 🚀 Entry point CLI
-# =========================================================
 def main():
-    """Esecuzione manuale"""
+    # test manuale
     generate_for_round(round_number=11, season=2025, mode="pure")
 
 

@@ -9,6 +9,7 @@ import os
 import joblib
 import pandas as pd
 from datetime import datetime
+import csv
 from pathlib import Path
 from src.core.config import PATHS
 from src.core.logger import get_logger
@@ -90,3 +91,51 @@ def save_report(content: str, filename_prefix="evaluation_report", ext="txt"):
         f.write(content)
     logger.info(f"📝 Report salvato in {file_path}")
     return file_path
+
+def form_to_index(form_str: str, max_length: int = 5) -> float:
+    """
+    Converte la 'form' (es. 'WDLWW') in un indice numerico medio.
+
+    W = 3 punti, D = 1 punto, L = 0 punti
+    Se mancano dati o la stringa è vuota, restituisce 0.
+
+    Args:
+        form_str (str): sequenza risultati (es. "WDLWW")
+        max_length (int): numero massimo di partite recenti da considerare
+
+    Returns:
+        float: media dei punti (0–3)
+    """
+    if not isinstance(form_str, str) or not form_str:
+        return 0.0
+    mapping = {"W": 3, "D": 1, "L": 0}
+    values = [mapping.get(ch, 0) for ch in form_str[-max_length:]]
+    return round(sum(values) / len(values), 2) if values else 0.0
+
+def log_model_run(report_path: str, metrics: dict, model_name: str, season: int, round_number: int, note: str = ""):
+    """
+    Registra le metriche di una valutazione in un CSV cumulativo.
+    """
+    csv_path = os.path.join(os.path.dirname(report_path), "model_runs.csv")
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    row = {
+        "timestamp": timestamp,
+        "season": season,
+        "round": round_number,
+        "model_name": model_name,
+        "accuracy": metrics.get("accuracy"),
+        "f1": metrics.get("f1"),
+        "precision": metrics.get("precision"),
+        "recall": metrics.get("recall"),
+        "samples": metrics.get("samples", ""),
+        "dataset_size": metrics.get("dataset_size", ""),
+        "note": note
+    }
+
+    file_exists = os.path.exists(csv_path)
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=row.keys())
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
