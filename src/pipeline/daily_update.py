@@ -474,7 +474,7 @@ def round_to_int(round_str: str | None) -> int | None:
 # ---------------------------------------------------------
 def main():
     logger.info("🚀 Avvio DAILY UPDATE SoS-IA")
-
+    '''
     # 1) aggiornamento dati da API -> DB
     conn = sqlite3.connect(DB_PATH)
     update_fixtures(conn)
@@ -487,7 +487,7 @@ def main():
     # 2) Ottimizza DB dopo aggiornamenti
     logger.info("🧠 Ottimizzo e ricreo viste post-aggiornamento...")
     optimize_database()
-
+    '''
     # 3) --- PARTE ML NUOVA ---
     conn = sqlite3.connect(DB_PATH)
     season = current_season()
@@ -517,7 +517,7 @@ def main():
 
     # 3c) evaluation
     if eval_round:
-        evaluate_on_round(round_number=eval_round, season=season)
+        evaluate_on_round(round_number=eval_round, season=season, model_path=model_path)
     else:
         logger.warning("⚠️ Nessun round di valutazione disponibile (stagione troppo all’inizio).")
 
