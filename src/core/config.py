@@ -30,6 +30,8 @@ PATHS = {
     "models": Path(DATA_PATH) / "models",
     "logs": Path(DATA_PATH) / "logs",
     "reports": Path(DATA_PATH) / "reports",
+    "teams": Path(DATA_PATH) / "fantacalcio" / "squadre",
+    "suggestions": Path(DATA_PATH) / "fantacalcio" / "suggestioni",
 }
 
 # Crea automaticamente le sottocartelle se mancano

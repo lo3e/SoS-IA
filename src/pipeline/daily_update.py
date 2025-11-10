@@ -166,7 +166,7 @@ def update_standings(conn):
 # ---------------------------------------------------------
 # 3) injuries
 # ---------------------------------------------------------
-def update_injuries(conn):
+'''def update_injuries(conn):
     data = call_api("/injuries", {"league": LEAGUE_ID, "season": current_season()})
     if not data:
         logger.info("⚠️ Nessun infortunio nuovo.")
@@ -199,7 +199,79 @@ def update_injuries(conn):
         ))
         inserted += 1
 
+    conn.commit()'''
+
+def update_injuries(conn):
+    """
+    Aggiorna la tabella 'injuries' nel DB locale usando l'endpoint /injuries.
+    Include motivo, tipo, data e nome squadra, come negli ultimi test live.
+    """
+    data = call_api("/injuries", {"league": LEAGUE_ID, "season": current_season()})
+    if not data:
+        logger.info("⚠️ Nessun infortunio nuovo.")
+        return
+
+    c = conn.cursor()
+    inserted = 0
+
+    for inj in data:
+        fixture = inj.get("fixture", {})
+        player = inj.get("player", {})
+        team = inj.get("team", {})
+
+        fixture_id = fixture.get("id")
+        player_id = player.get("id")
+        team_id = team.get("id")
+
+        # recupera informazioni complete
+        player_name = player.get("name")
+        team_name = team.get("name")
+        reason = player.get("reason") or "Unknown"
+        injury_type = player.get("type") or "Unknown"
+        fixture_date = fixture.get("date")
+
+        # Evita duplicati
+        c.execute("""
+            SELECT 1 FROM injuries
+            WHERE match_id = ? AND player_id = ? AND team_id = ?
+        """, (fixture_id, player_id, team_id))
+        if c.fetchone():
+            continue
+
+        # Inserisce anche data, tipo e nome squadra se la tabella li supporta
+        try:
+            c.execute("""
+                INSERT INTO injuries (
+                    match_id, player_id, player_name, team_id, team_name, date, reason, type
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                fixture_id,
+                player_id,
+                player_name,
+                team_id,
+                team_name,
+                fixture_date,
+                reason,
+                injury_type
+            ))
+        except Exception:
+            # fallback per vecchia struttura tabella
+            c.execute("""
+                INSERT INTO injuries (
+                    match_id, player_id, player_name, team_id, reason
+                ) VALUES (?, ?, ?, ?, ?)
+            """, (
+                fixture_id,
+                player_id,
+                player_name,
+                team_id,
+                reason
+            ))
+
+        inserted += 1
+
     conn.commit()
+    logger.info(f"✅ Inseriti {inserted} nuovi record in 'injuries'.")
 
     # <-- QUI USIAMO IL NUOVO MODULO DI CLASSIFICAZIONE -->
     add_category_column(conn)
