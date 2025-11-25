@@ -63,7 +63,7 @@ def update_fixtures(conn):
         SELECT match_id, date
         FROM matches
         WHERE status != 'FT'
-           OR date(date) >= date('now', '-3 days')
+           OR date(date) >= date('now', '-17 days')
     """)
     rows = c.fetchall()
     if not rows:
@@ -79,12 +79,12 @@ def update_fixtures(conn):
         try:
             dt = datetime.fromisoformat(date_str.replace("Z", "")).replace(tzinfo=timezone.utc)
             delta_days = (dt - now).days
-            if -3 <= delta_days <= DAYS_AHEAD:
+            if -17 <= delta_days <= DAYS_AHEAD:
                 to_update.append(match_id)
         except Exception:
             continue
 
-    logger.info(f"📅 Fixtures da aggiornare (-3 → +{DAYS_AHEAD} giorni): {len(to_update)}")
+    logger.info(f"📅 Fixtures da aggiornare (-17 → +{DAYS_AHEAD} giorni): {len(to_update)}")
 
     for idx, fixture_id in enumerate(to_update, start=1):
         logger.info(f"  ({idx}/{len(to_update)}) 🔁 fixture {fixture_id}")
